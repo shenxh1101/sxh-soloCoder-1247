@@ -95,6 +95,20 @@ CHANNEL_KEYWORDS = {
 }
 
 DEFAULT_CONFIG_FILENAME = "package_organizer_config.json"
+UNDO_RECORD_FILENAME = "package_organizer_undo.json"
+
+TEMPLATE_VARS = {
+    "name": "软件名",
+    "version": "版本号",
+    "platform": "平台(Windows/macOS/Linux)",
+    "arch": "架构(x64/arm64等)",
+    "release_type": "发行类型(stable/beta等)",
+    "distribution": "发行渠道(portable/offline等)",
+    "package_type": "打包类型(universal/setup等)",
+}
+
+DEFAULT_NAME_TEMPLATE = "{name}-{version}-{release_type}{distribution}{package_type}-{platform}-{arch}"
+
 
 
 @dataclass
@@ -146,7 +160,9 @@ class PackageOrganizer:
         manifest_format: str = "json",
         append_manifest: bool = True,
         name_include_channel: bool = True,
-        custom_platform_dirs: Optional[dict] = None
+        name_template: Optional[str] = None,
+        custom_platform_dirs: Optional[dict] = None,
+        profile_name: str = "default"
     ):
         self.source_dir = source_dir.expanduser().resolve()
         self.target_dir = (target_dir.expanduser().resolve() if target_dir else self.source_dir)
@@ -161,10 +177,13 @@ class PackageOrganizer:
         self.manifest_format = manifest_format
         self.append_manifest = append_manifest
         self.name_include_channel = name_include_channel
+        self.name_template = name_template or DEFAULT_NAME_TEMPLATE
         self.custom_platform_dirs = custom_platform_dirs or {}
+        self.profile_name = profile_name
         self.execution_time = self._get_current_timestamp()
         self.packages: list[PackageInfo] = []
         self.excluded_files: list[ExcludedFileInfo] = []
+        self.undo_records: list[dict] = []
         self.stats = {
             "total": 0,
             "moved": 0,
@@ -183,10 +202,13 @@ class PackageOrganizer:
         logger.info(f"源目录: {self.source_dir}")
         if self.target_dir != self.source_dir:
             logger.info(f"目标目录: {self.target_dir}")
+        if self.profile_name and self.profile_name != "default":
+            logger.info(f"使用配置档案: {self.profile_name}")
         logger.info(f"执行时间: {self.execution_time}")
         logger.info(f"试运行模式: {'开启' if self.dry_run else '关闭'}")
         logger.info(f"签名验证: {'开启' if self.verify_signatures else '关闭'}")
         logger.info(f"清单追加模式: {'开启' if self.append_manifest else '关闭'}")
+        logger.info(f"文件名模板: {self.name_template}")
         logger.info(f"文件名包含渠道信息: {'开启' if self.name_include_channel else '关闭'}")
         if self.custom_platform_dirs:
             for p, d in self.custom_platform_dirs.items():
@@ -214,6 +236,8 @@ class PackageOrganizer:
             self._print_preview_report()
         else:
             self._print_summary()
+            if self.undo_records:
+                self._save_undo_records()
 
         if self.generate_manifest:
             self._generate_manifest()
@@ -534,63 +558,63 @@ class PackageOrganizer:
         default_dir_name = PLATFORM_DIRS.get(platform, "Unknown")
         return self.target_dir / default_dir_name
 
-    def _prepare_target_path(self, pkg: PackageInfo):
-        name_parts = []
-        if pkg.software_name:
-            name_parts.append(pkg.software_name)
-        if pkg.version:
-            name_parts.append(pkg.version)
-        if not name_parts:
-            name_parts.append(pkg.original_path.stem)
-
-        base_name = "-".join(name_parts)
-        base_name = re.sub(r"[-_]+", "-", base_name)
-
-        if self.name_include_channel:
-            channel_parts = []
-            if pkg.release_type and pkg.release_type != "stable":
-                channel_parts.append(pkg.release_type)
-            if pkg.distribution:
-                channel_parts.append(pkg.distribution)
-            if pkg.package_type and pkg.package_type != "setup":
-                channel_parts.append(pkg.package_type)
-            if channel_parts:
-                base_name = base_name + "-" + "-".join(channel_parts)
-
+    def _apply_name_template(self, pkg: PackageInfo) -> str:
         platform_label = PLATFORM_LABELS.get(pkg.platform, "Unknown")
 
-        existing_platform = None
+        template_values = {
+            "name": pkg.software_name or pkg.original_path.stem,
+            "version": pkg.version,
+            "platform": platform_label,
+            "arch": pkg.arch,
+            "release_type": pkg.release_type if (self.name_include_channel and pkg.release_type != "stable") else "",
+            "distribution": pkg.distribution if self.name_include_channel else "",
+            "package_type": pkg.package_type if (self.name_include_channel and pkg.package_type not in ["setup", "installer"]) else "",
+        }
+
+        result = self.name_template
+
+        for key in ["release_type", "distribution", "package_type"]:
+            val = template_values.get(key, "")
+            if val:
+                if key != "name":
+                    placeholder = "{" + key + "}"
+                    result = result.replace(placeholder, "-" + val)
+                else:
+                    placeholder = "{" + key + "}"
+                    result = result.replace(placeholder, val)
+            else:
+                placeholder = "{" + key + "}"
+                result = result.replace(placeholder, "")
+
+        for key in ["name", "version", "platform", "arch"]:
+            val = template_values.get(key, "")
+            placeholder = "{" + key + "}"
+            if val:
+                result = result.replace(placeholder, val)
+            else:
+                result = result.replace(placeholder, "")
+
         for label in PLATFORM_LABELS.values():
-            if re.search(rf"[-_]{label}[-_]?\b", base_name, re.IGNORECASE):
-                existing_platform = label
-                base_name = re.sub(rf"[-_]{label}[-_]?\b", "-", base_name, flags=re.IGNORECASE)
-                base_name = re.sub(r"[-_]+", "-", base_name).strip(" -")
-                break
+            result = re.sub(rf"[-_]{label}[-_]?", "-", result, flags=re.IGNORECASE)
 
-        if existing_platform:
-            platform_label = existing_platform
+        result = re.sub(r"-{2,}", "-", result)
+        result = result.strip(" -")
 
-        if pkg.arch:
-            new_name = f"{base_name}-{platform_label}-{pkg.arch}{pkg.file_ext}"
-        else:
-            new_name = f"{base_name}-{platform_label}{pkg.file_ext}"
+        if not result:
+            result = pkg.original_path.stem
 
-        new_name = re.sub(r"-{2,}", "-", new_name)
+        return f"{result}{pkg.file_ext}"
+
+    def _prepare_target_path(self, pkg: PackageInfo):
         pkg.target_dir = self._get_platform_dir(pkg.platform)
-
-        pkg.new_filename = new_name
-        pkg.target_path = pkg.target_dir / new_name
+        pkg.new_filename = self._apply_name_template(pkg)
+        pkg.target_path = pkg.target_dir / pkg.new_filename
 
         counter = 1
         while pkg.target_path.exists() and pkg.target_path.resolve() != pkg.original_path.resolve():
-            channel_suffix = "-" + "-".join(channel_parts) if (self.name_include_channel and channel_parts) else ""
-            if pkg.arch:
-                new_name = f"{base_name}{channel_suffix}-{platform_label}-{pkg.arch}-{counter}{pkg.file_ext}"
-            else:
-                new_name = f"{base_name}{channel_suffix}-{platform_label}-{counter}{pkg.file_ext}"
-            new_name = re.sub(r"-{2,}", "-", new_name)
-            pkg.target_path = pkg.target_dir / new_name
-            pkg.new_filename = new_name
+            stem = pkg.new_filename[:-len(pkg.file_ext)] if pkg.new_filename.endswith(pkg.file_ext) else pkg.new_filename
+            pkg.new_filename = f"{stem}-{counter}{pkg.file_ext}"
+            pkg.target_path = pkg.target_dir / pkg.new_filename
             counter += 1
 
         logger.debug(f"  目标路径: {pkg.target_dir.name}/{pkg.target_path.name}")
@@ -620,6 +644,15 @@ class PackageOrganizer:
             self.stats["moved"] += 1
             action = "已移动并重命名" if pkg.renamed else "已移动"
             logger.info(f"  ✓ {action}: {pkg.target_dir.name}/{pkg.target_path.name}")
+
+            self.undo_records.append({
+                "from": str(pkg.target_path.resolve()),
+                "to": str(pkg.original_path.resolve()),
+                "original_name": pkg.original_path.name,
+                "new_name": pkg.target_path.name,
+                "size": pkg.file_size,
+                "sha256": pkg.sha256_hash,
+            })
         except Exception as e:
             pkg.skipped = True
             pkg.skip_reason = f"移动失败: {e}"
@@ -732,6 +765,275 @@ class PackageOrganizer:
             logger.info(f"已签名:      {self.stats['signed']}")
             logger.warning(f"未签名:      {self.stats['unsigned']}")
             logger.info(f"无法验证:    {self.stats['sig_unknown']}")
+        if self.undo_records:
+            logger.info(f"可撤销文件:  {len(self.undo_records)} (使用 --undo 撤销)")
+
+    def _save_undo_records(self):
+        undo_path = self.source_dir / UNDO_RECORD_FILENAME
+        try:
+            existing = []
+            if undo_path.exists():
+                try:
+                    with open(undo_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        existing = data.get("undo_history", [])
+                except (json.JSONDecodeError, IOError):
+                    pass
+
+            undo_entry = {
+                "timestamp": self.execution_time,
+                "profile": self.profile_name,
+                "dry_run": self.dry_run,
+                "records": self.undo_records
+            }
+            existing.insert(0, undo_entry)
+
+            with open(undo_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "undo_version": "1.0",
+                    "last_updated": self._get_current_timestamp(),
+                    "undo_history": existing[:10]
+                }, f, ensure_ascii=False, indent=2)
+            logger.info(f"✓ 撤销记录已保存: {UNDO_RECORD_FILENAME}")
+        except Exception as e:
+            logger.error(f"保存撤销记录失败: {e}")
+
+    @staticmethod
+    def undo_last_operation(source_dir: Path, dry_run: bool = True, index: int = 0) -> bool:
+        undo_path = source_dir / UNDO_RECORD_FILENAME
+        if not undo_path.exists():
+            logger.error(f"找不到撤销记录文件: {undo_path}")
+            return False
+
+        try:
+            with open(undo_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            history = data.get("undo_history", [])
+            if not history:
+                logger.error("没有可撤销的操作记录")
+                return False
+
+            if index >= len(history):
+                logger.error(f"撤销记录索引超出范围: {index}，最多 {len(history) - 1}")
+                return False
+
+            entry = history[index]
+            records = entry.get("records", [])
+            logger.info(f"{'='*60}")
+            logger.info(f"撤销操作 - {entry.get('timestamp', '未知时间')}")
+            logger.info(f"{'='*60}")
+            logger.info(f"档案: {entry.get('profile', 'default')}")
+            logger.info(f"模式: {'试运行' if entry.get('dry_run') else '实际执行'}")
+            logger.info(f"待撤销文件数: {len(records)}")
+            logger.info("")
+
+            success_count = 0
+            fail_count = 0
+
+            for i, record in enumerate(records, 1):
+                from_path = Path(record["from"])
+                to_path = Path(record["to"])
+                size_str = PackageOrganizer._static_format_size(record.get("size", 0))
+
+                if dry_run:
+                    logger.info(f"  [{i}/{len(records)}] [试运行] 将撤销: "
+                               f"{from_path.name} ({size_str}) -> {to_path.parent.name}/{to_path.name}")
+                    success_count += 1
+                    continue
+
+                if not from_path.exists():
+                    logger.warning(f"  [{i}/{len(records)}] ⚠  源文件不存在，已跳过: {from_path}")
+                    fail_count += 1
+                    continue
+
+                if to_path.exists():
+                    logger.warning(f"  [{i}/{len(records)}] ⚠  目标路径已存在，已跳过: {to_path}")
+                    fail_count += 1
+                    continue
+
+                try:
+                    to_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(from_path), str(to_path))
+                    logger.info(f"  [{i}/{len(records)}] ✓ 已撤销: "
+                               f"{from_path.name} ({size_str}) -> {to_path.parent.name}/{to_path.name}")
+                    success_count += 1
+                except Exception as e:
+                    logger.error(f"  [{i}/{len(records)}] ✗ 撤销失败: {e}")
+                    fail_count += 1
+
+            logger.info("")
+            logger.info(f"撤销完成: 成功 {success_count}，失败 {fail_count}")
+            if not dry_run:
+                logger.info("提示: 如需彻底移除撤销记录，可手动删除 package_organizer_undo.json")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"撤销操作失败: {e}")
+            return False
+
+    @staticmethod
+    def _static_format_size(size_bytes: int) -> str:
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+
+    @staticmethod
+    def query_manifest(
+        source_dir: Path,
+        manifest_format: str = "json",
+        platform: Optional[str] = None,
+        release_type: Optional[str] = None,
+        distribution: Optional[str] = None,
+        dry_run_only: Optional[bool] = None,
+        signature_status: Optional[str] = None,
+        output_format: str = "table"
+    ):
+        manifest_path = source_dir / f"package_manifest.{manifest_format}"
+        if not manifest_path.exists():
+            logger.error(f"找不到清单文件: {manifest_path}")
+            return False
+
+        logger.info(f"{'='*60}")
+        logger.info(f"清单历史查询")
+        logger.info(f"{'='*60}")
+        logger.info(f"查询条件:")
+        if platform:
+            logger.info(f"  平台: {platform}")
+        if release_type:
+            logger.info(f"  发行类型: {release_type}")
+        if distribution:
+            logger.info(f"  发行渠道: {distribution}")
+        if dry_run_only is not None:
+            logger.info(f"  执行模式: {'仅试运行' if dry_run_only else '仅实际执行'}")
+        if signature_status:
+            logger.info(f"  签名状态: {signature_status}")
+        logger.info("")
+
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            history = data.get("execution_history", [])
+            if not history:
+                logger.warning("清单中没有历史记录")
+                return False
+
+            results = []
+            for exec_idx, exec_record in enumerate(history):
+                exec_time = exec_record.get("execution_time", "")
+                is_dry = exec_record.get("dry_run", False)
+
+                if dry_run_only is not None and is_dry != dry_run_only:
+                    continue
+
+                for pkg in exec_record.get("packages", []):
+                    pkg_platform = pkg.get("platform", "")
+                    pkg_rel = pkg.get("release_type", "")
+                    pkg_dist = pkg.get("distribution", "")
+                    pkg_sig = pkg.get("signature", {}).get("status", "")
+
+                    if platform and platform.lower() not in pkg_platform.lower():
+                        continue
+                    if release_type and release_type.lower() not in pkg_rel.lower():
+                        continue
+                    if distribution and distribution.lower() not in pkg_dist.lower():
+                        continue
+                    if signature_status and signature_status.lower() != pkg_sig.lower():
+                        continue
+
+                    results.append({
+                        "exec_index": exec_idx,
+                        "execution_time": exec_time,
+                        "dry_run": is_dry,
+                        "original_filename": pkg.get("original_filename", ""),
+                        "new_filename": pkg.get("new_filename", ""),
+                        "software_name": pkg.get("software_name", ""),
+                        "version": pkg.get("version", ""),
+                        "platform": pkg_platform,
+                        "release_type": pkg_rel,
+                        "distribution": pkg_dist,
+                        "architecture": pkg.get("architecture", ""),
+                        "file_size_human": pkg.get("file_size_human", ""),
+                        "signature_status": pkg_sig,
+                        "signer": pkg.get("signature", {}).get("details", {}).get("signer", "") if isinstance(pkg.get("signature", {}).get("details"), dict) else "",
+                        "moved": pkg.get("moved", False),
+                        "sha256_hash": pkg.get("sha256_hash", "")[:16] + "..." if pkg.get("sha256_hash") else ""
+                    })
+
+            if not results:
+                logger.warning("没有找到符合条件的记录")
+                return True
+
+            logger.info(f"找到 {len(results)} 条符合条件的记录:")
+            logger.info("")
+
+            if output_format == "json":
+                print(json.dumps(results, ensure_ascii=False, indent=2))
+            elif output_format == "csv":
+                import csv
+                import io
+                if results:
+                    output = io.StringIO()
+                    writer = csv.DictWriter(output, fieldnames=results[0].keys())
+                    writer.writeheader()
+                    writer.writerows(results)
+                    print(output.getvalue())
+            else:
+                PackageOrganizer._print_query_table(results)
+
+            logger.info("")
+            logger.info(f"共 {len(results)} 条记录")
+            return True
+
+        except Exception as e:
+            logger.error(f"查询清单失败: {e}")
+            return False
+
+    @staticmethod
+    def _print_query_table(results: list):
+        if not results:
+            return
+
+        sig_map = {
+            "signed": "✓已签",
+            "unsigned": "✗未签",
+            "unknown": "?未知",
+            "not_checked": "未检查"
+        }
+
+        headers = [
+            ("时间", 19), ("软件名", 16), ("版本", 14), ("平台", 7),
+            ("发行类型", 8), ("渠道", 8), ("架构", 7), ("大小", 9),
+            ("签名", 6), ("原文件名", 28)
+        ]
+
+        header_line = " | ".join(h.ljust(w) for h, w in headers)
+        sep_line = "-+-".join("-" * w for _, w in headers)
+        logger.info(header_line)
+        logger.info(sep_line)
+
+        for r in results:
+            mode = "试运行" if r["dry_run"] else "实执行"
+            sig = sig_map.get(r["signature_status"], r["signature_status"])
+            row = [
+                r["execution_time"][-19:].ljust(19),
+                (r["software_name"][:15] + "…") if len(r["software_name"]) > 16 else r["software_name"].ljust(16),
+                (r["version"][:13] + "…") if len(r["version"]) > 14 else r["version"].ljust(14),
+                (r["platform"][:6] or "-").ljust(7),
+                (r["release_type"][:7] or "-").ljust(8),
+                (r["distribution"][:7] or "-").ljust(8),
+                (r["architecture"][:6] or "-").ljust(7),
+                r["file_size_human"].ljust(9),
+                sig.ljust(6),
+                (r["original_filename"][:27] + "…") if len(r["original_filename"]) > 28 else r["original_filename"].ljust(28),
+            ]
+            logger.info(" | ".join(row))
 
     def _generate_manifest(self):
         manifest_path = self.source_dir / f"package_manifest.{self.manifest_format}"
@@ -910,7 +1212,8 @@ def parse_size(size_str: str) -> int:
 
 def get_default_config() -> dict:
     return {
-        "config_version": "1.0",
+        "config_version": "2.0",
+        "default_profile": "default",
         "source_directory": ".",
         "target_directory": None,
         "options": {
@@ -922,9 +1225,7 @@ def get_default_config() -> dict:
             "name_include_channel": True,
         },
         "naming": {
-            "include_platform": True,
-            "include_architecture": True,
-            "include_channel": True,
+            "name_template": "{name}-{version}-{release_type}{distribution}{package_type}-{platform}-{arch}",
             "custom_platform_dirs": {
                 "windows": "Windows",
                 "macos": "macOS",
@@ -948,19 +1249,71 @@ def get_default_config() -> dict:
             ],
             "min_size": None,
             "max_size": None
+        },
+        "profiles": {
+            "_comment": "多套配置档案，运行时用 --profile 指定。每套可独立覆盖 default 的 target/options/naming/exclude_rules",
+            "work": {
+                "target_directory": None,
+                "options": {
+                    "manifest_format": "json",
+                    "name_include_channel": True,
+                },
+                "naming": {
+                    "name_template": "{name}-{version}-{platform}-{arch}"
+                },
+                "exclude_rules": {
+                    "filename_patterns": [],
+                    "subdirectories": ["incomplete"]
+                }
+            },
+            "personal": {
+                "target_directory": None,
+                "options": {
+                    "manifest_format": "json",
+                    "name_include_channel": True,
+                },
+                "naming": {
+                    "name_template": "{name}-{version}-{release_type}{distribution}-{platform}-{arch}"
+                },
+                "exclude_rules": {
+                    "subdirectories": ["incomplete", "temp"]
+                }
+            },
+            "archive": {
+                "target_directory": None,
+                "options": {
+                    "manifest_format": "csv",
+                    "append_manifest": True,
+                },
+                "naming": {
+                    "name_template": "{name}-{version}-{distribution}{package_type}-{platform}-{arch}"
+                },
+                "exclude_rules": {
+                    "min_size": None,
+                    "max_size": None
+                }
+            }
         }
     }
 
 
 def generate_sample_config(config_path: Path) -> bool:
     sample_config = get_default_config()
-    sample_config["_comment"] = "安装包整理工具配置文件 - 所有设置都可以被命令行参数覆盖"
+    sample_config["_comment"] = (
+        "安装包整理工具配置文件 v2.0 - 所有设置都可以被命令行参数覆盖\n"
+        "name_template 可用变量: {name}软件名 {version}版本号 {platform}平台 {arch}架构\n"
+        "                      {release_type}发行类型(stable/beta/rc等) {distribution}发行渠道(portable/offline等) {package_type}打包类型"
+    )
+    sample_config["naming"]["_comment_template"] = "默认模板: {name}-{version}-{release_type}{distribution}{package_type}-{platform}-{arch}"
+    sample_config["naming"]["_comment_vars"] = list(TEMPLATE_VARS.keys())
     sample_config["exclude_rules"]["_comment_patterns"] = "支持正则表达式，匹配文件名"
     sample_config["exclude_rules"]["_comment_subdirs"] = "只匹配完整的子目录名，不会部分匹配"
     try:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(sample_config, f, ensure_ascii=False, indent=2)
         logger.info(f"✓ 已生成示例配置文件: {config_path}")
+        logger.info(f"  可用档案: work, personal, archive 或自定义")
+        logger.info(f"  命名模板变量: {', '.join(TEMPLATE_VARS.keys())}")
         return True
     except Exception as e:
         logger.error(f"生成配置文件失败: {e}")
@@ -989,35 +1342,69 @@ def load_config(config_path: Optional[Path]) -> Optional[dict]:
         return None
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    result = dict(base)
+    for k, v in override.items():
+        if k.startswith("_"):
+            continue
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
 def merge_config_with_args(config: Optional[dict], args) -> dict:
     if not config:
         return {}
 
     result = {}
 
-    source_dir = config.get("source_directory", ".")
+    profile_name = getattr(args, "profile", None) or config.get("default_profile", "default")
+    profiles = config.get("profiles", {})
+
+    if profile_name != "default" and profile_name in profiles:
+        logger.info(f"应用配置档案: {profile_name}")
+        profile_cfg = profiles[profile_name]
+        effective_cfg = _deep_merge(dict(config), profile_cfg)
+    else:
+        effective_cfg = config
+
+    result["profile_name"] = profile_name
+
+    source_dir = effective_cfg.get("source_directory", ".")
     if getattr(args, "directory", None) and args.directory != ".":
         source_dir = args.directory
     result["source_dir"] = Path(source_dir)
 
-    target_dir = config.get("target_directory")
+    target_dir = effective_cfg.get("target_directory")
     if target_dir:
         result["target_dir"] = Path(target_dir)
 
-    options = config.get("options", {})
+    options = effective_cfg.get("options", {})
     result["dry_run"] = args.dry_run or options.get("dry_run", False)
     result["verify_signatures"] = not args.no_verify_signatures and options.get("verify_signatures", True)
     result["generate_manifest"] = not args.no_manifest and options.get("generate_manifest", True)
     result["manifest_format"] = args.manifest_format if args.manifest_format != "json" else options.get("manifest_format", "json")
-    result["append_manifest"] = not args.no_append_manifest and options.get("append_manifest", True)
-    result["name_include_channel"] = options.get("name_include_channel", True)
+    if not options.get("append_manifest", True):
+        result["append_manifest"] = False
+    else:
+        result["append_manifest"] = not args.no_append_manifest and True
 
-    naming = config.get("naming", {})
+    if args.no_channel_in_name:
+        result["name_include_channel"] = False
+    else:
+        result["name_include_channel"] = options.get("name_include_channel", True)
+
+    naming = effective_cfg.get("naming", {})
     custom_dirs = naming.get("custom_platform_dirs", {})
     if custom_dirs:
         result["custom_platform_dirs"] = custom_dirs
+    name_template = naming.get("name_template", DEFAULT_NAME_TEMPLATE)
+    if name_template:
+        result["name_template"] = name_template
 
-    exclude_rules = config.get("exclude_rules", {})
+    exclude_rules = effective_cfg.get("exclude_rules", {})
 
     exclude_patterns = list(exclude_rules.get("filename_patterns", []))
     if args.exclude:
@@ -1063,49 +1450,43 @@ def main():
   使用 -c/--config 指定自定义配置文件
   使用 --generate-config 生成示例配置
 
+文件名模板变量 (--name-template 或在配置文件中 naming.name_template):
+  {name}软件名  {version}版本号  {platform}平台  {arch}架构
+  {release_type}发行类型(stable/beta/rc等)
+  {distribution}发行渠道(portable/offline等)
+  {package_type}打包类型(setup/bundle等)
+  例: {name}-{version}-{platform}-{arch}  -> 软件-1.0-Windows-x64.exe
+
 示例:
   # 整理当前目录下的安装包（自动使用配置文件）
   python package_organizer.py
 
-  # 生成示例配置文件
+  # 生成示例配置文件（含 work/personal/archive 档案）
   python package_organizer.py --generate-config
 
-  # 使用指定配置文件
-  python package_organizer.py -c my_config.json
+  # 使用指定配置档案
+  python package_organizer.py --profile work -d ~/Downloads
 
-  # 整理指定目录，试运行模式（预览效果）
-  python package_organizer.py -d ~/Downloads --dry-run
-
-  # 命令行参数会覆盖配置文件中的设置
-  python package_organizer.py -c config.json -d ~/Downloads --dry-run
-
-  # 按文件名排除（支持正则，会追加到配置中的规则）
-  python package_organizer.py -d ~/Downloads --exclude temp test
-
-  # 按扩展名排除
-  python package_organizer.py -d ~/Downloads --exclude-ext .msi .deb
-
-  # 按子目录排除（只匹配完整目录名，不会部分匹配）
-  python package_organizer.py -d ~/Downloads --exclude-subdir temp incomplete
-
-  # 按文件大小过滤（小于10MB或大于5GB的跳过）
-  python package_organizer.py -d ~/Downloads --min-size 10MB --max-size 5GB
-
-  # 生成 CSV 格式的清单
-  python package_organizer.py -d ~/Downloads --manifest-format csv
-
-  # 覆盖模式（不追加到历史记录）
-  python package_organizer.py -d ~/Downloads --no-append-manifest
-
-  # 跳过签名验证
-  python package_organizer.py -d ~/Downloads --no-verify-signatures
-
-  # 组合使用多个排除规则
+  # 自定义命名模板并试运行预览
   python package_organizer.py -d ~/Downloads --dry-run \\
-      --exclude temp old \\
-      --exclude-ext .msi \\
-      --exclude-subdir incomplete \\
-      --min-size 1MB
+      --name-template "{version}-{name}-{platform}-{arch}"
+
+  # 临时关闭渠道信息（命令行优先级最高）
+  python package_organizer.py -d ~/Downloads --no-channel-in-name
+
+  # 撤销上次整理（试运行预览）
+  python package_organizer.py -d ~/Downloads --undo
+
+  # 真正执行撤销
+  python package_organizer.py -d ~/Downloads --undo --execute-undo
+
+  # 查询清单历史（筛选未签名的 Windows 安装包）
+  python package_organizer.py -d ~/Downloads --query \\
+      --filter-platform Windows --filter-signature unsigned
+
+  # 查询结果导出 JSON
+  python package_organizer.py -d ~/Downloads --query \\
+      --filter-channel portable --query-output json
         """
     )
 
@@ -1208,7 +1589,77 @@ def main():
     parser.add_argument(
         "--no-channel-in-name",
         action="store_true",
-        help="文件名中不包含发行渠道/类型信息"
+        help="文件名中不包含发行渠道/类型信息（命令行优先级高于配置文件）"
+    )
+
+    parser.add_argument(
+        "--name-template",
+        default=None,
+        help="自定义文件名模板，如 \"{name}-{version}-{platform}-{arch}\""
+    )
+
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="使用配置文件中的某个档案(如 work/personal/archive)"
+    )
+
+    undo_group = parser.add_argument_group("撤销操作")
+    undo_group.add_argument(
+        "--undo",
+        action="store_true",
+        help="撤销上次整理的文件移动（默认试运行，加 --execute-undo 真正执行）"
+    )
+    undo_group.add_argument(
+        "--execute-undo",
+        action="store_true",
+        help="配合 --undo 真正执行撤销，否则只试运行"
+    )
+    undo_group.add_argument(
+        "--undo-index",
+        type=int,
+        default=0,
+        help="撤销第 N 条历史记录（默认0，从最新的）"
+    )
+
+    query_group = parser.add_argument_group("清单查询")
+    query_group.add_argument(
+        "--query",
+        action="store_true",
+        help="进入查询模式，读取清单历史并按条件筛选输出"
+    )
+    query_group.add_argument(
+        "--filter-platform",
+        default=None,
+        help="筛选: 平台 (Windows/macOS/Linux)"
+    )
+    query_group.add_argument(
+        "--filter-release-type",
+        default=None,
+        help="筛选: 发行类型 (stable/beta/rc 等)"
+    )
+    query_group.add_argument(
+        "--filter-channel",
+        default=None,
+        help="筛选: 发行渠道 (portable/offline/full 等)"
+    )
+    query_group.add_argument(
+        "--filter-dry-run-only",
+        choices=["true", "false"],
+        default=None,
+        help="筛选: 执行模式 (true=仅试运行, false=仅实际执行)"
+    )
+    query_group.add_argument(
+        "--filter-signature",
+        choices=["signed", "unsigned", "unknown"],
+        default=None,
+        help="筛选: 签名状态 (signed/unsigned/unknown)"
+    )
+    query_group.add_argument(
+        "--query-output",
+        choices=["table", "json", "csv"],
+        default="table",
+        help="查询结果输出格式 (默认: table)"
     )
 
     parser.add_argument(
@@ -1253,6 +1704,38 @@ def main():
 
     merged = merge_config_with_args(config, args)
 
+    if args.undo:
+        undo_dry_run = not args.execute_undo
+        PackageOrganizer.undo_last_operation(
+            target_source_dir,
+            dry_run=undo_dry_run,
+            index=args.undo_index
+        )
+        sys.exit(0)
+
+    if args.query:
+        dry_run_only = None
+        if args.filter_dry_run_only == "true":
+            dry_run_only = True
+        elif args.filter_dry_run_only == "false":
+            dry_run_only = False
+
+        manifest_format = args.manifest_format
+        if merged and merged.get("manifest_format"):
+            manifest_format = merged["manifest_format"]
+
+        ok = PackageOrganizer.query_manifest(
+            target_source_dir,
+            manifest_format=manifest_format,
+            platform=args.filter_platform,
+            release_type=args.filter_release_type,
+            distribution=args.filter_channel,
+            dry_run_only=dry_run_only,
+            signature_status=args.filter_signature,
+            output_format=args.query_output
+        )
+        sys.exit(0 if ok else 1)
+
     organizer_kwargs = {
         "source_dir": merged.get("source_dir", target_source_dir),
         "dry_run": args.dry_run,
@@ -1268,6 +1751,12 @@ def main():
         "name_include_channel": not args.no_channel_in_name,
     }
 
+    if merged.get("profile_name"):
+        organizer_kwargs["profile_name"] = merged["profile_name"]
+
+    if args.name_template:
+        organizer_kwargs["name_template"] = args.name_template
+
     if args.target_dir:
         organizer_kwargs["target_dir"] = Path(args.target_dir).expanduser().resolve()
 
@@ -1275,18 +1764,31 @@ def main():
         for key, value in merged.items():
             if key == "source_dir":
                 continue
-            if key in ["dry_run", "verify_signatures", "generate_manifest",
-                       "append_manifest", "name_include_channel"]:
+            if key in ["dry_run", "verify_signatures", "generate_manifest"]:
                 if key not in organizer_kwargs or (
                     isinstance(organizer_kwargs.get(key), bool) and not organizer_kwargs[key]
                 ):
                     organizer_kwargs[key] = value
+            elif key == "append_manifest":
+                if "append_manifest" not in organizer_kwargs:
+                    organizer_kwargs["append_manifest"] = value
+                if value is False:
+                    organizer_kwargs["append_manifest"] = False
+            elif key == "name_include_channel":
+                if args.no_channel_in_name:
+                    organizer_kwargs["name_include_channel"] = False
+                elif "name_include_channel" not in organizer_kwargs:
+                    organizer_kwargs["name_include_channel"] = value
+            elif key == "name_template":
+                if not args.name_template and value:
+                    organizer_kwargs["name_template"] = value
+            elif key == "manifest_format":
+                if args.manifest_format == "json" and value != "json":
+                    organizer_kwargs["manifest_format"] = value
             elif key == "custom_platform_dirs":
                 organizer_kwargs["custom_platform_dirs"] = value
             elif key in ["exclude_patterns", "exclude_exts", "exclude_subdirs"]:
-                if value and key not in organizer_kwargs:
-                    organizer_kwargs[key] = value
-                elif value and key in organizer_kwargs and not organizer_kwargs[key]:
+                if value and not organizer_kwargs.get(key):
                     organizer_kwargs[key] = value
             elif key == "target_dir" and "target_dir" not in organizer_kwargs:
                 organizer_kwargs["target_dir"] = value
